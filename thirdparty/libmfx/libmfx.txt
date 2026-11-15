@@ -1,0 +1,2 @@
+built for avbuild project (https://github.com/wang-bin/avbuild)
+in libmfx.pc for MSVC, using -L${libdir} to be compatible with ffmpeg configure(it will filter out -libpath,/libpath)

@@ -1,0 +1,14 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libmfx
+Description: Intel Media SDK Dispatched static library
+Version: 2013
+Requires:
+Requires.private:
+Conflicts:
+Libs: -L${libdir} mfx.lib
+Libs.private: AdvAPI32.lib
+Cflags: -I${includedir}
