@@ -22,11 +22,49 @@ bool DxCapture::Start() {
     if (device_ || context_ || duplication_)
         Stop();
 
-    // 创建 D3D11 设备
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+        LogHResult(L"CreateDXGIFactory1 failed", hr);
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIAdapter> selectedAdapter;
+    Microsoft::WRL::ComPtr<IDXGIOutput> output;
+    int outputIndex = 0;
+    for (UINT adapterIndex = 0; !output; ++adapterIndex) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        hr = factory->EnumAdapters(adapterIndex, &adapter);
+        if (hr == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(hr)) {
+            LogHResult(L"IDXGIFactory::EnumAdapters failed", hr);
+            return false;
+        }
+
+        for (UINT adapterOutputIndex = 0; ; ++adapterOutputIndex) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> candidate;
+            hr = adapter->EnumOutputs(adapterOutputIndex, &candidate);
+            if (hr == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(hr)) {
+                LogHResult(L"IDXGIAdapter::EnumOutputs failed", hr);
+                return false;
+            }
+            if (outputIndex++ == monitorIndex_) {
+                output = candidate;
+                selectedAdapter = adapter;
+                break;
+            }
+        }
+    }
+    if (!output) {
+        CLogger::Message(0, L"No DXGI output found for monitor index %d", monitorIndex_);
+        return false;
+    }
+
     D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
     D3D_FEATURE_LEVEL usedLevel;
-    HRESULT hr = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+    hr = D3D11CreateDevice(
+        selectedAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         levels, _countof(levels), D3D11_SDK_VERSION,
         &device_, &usedLevel, &context_);
@@ -37,29 +75,6 @@ bool DxCapture::Start() {
     }
     CLogger::Message(0, L"Created D3D11 device; feature level=0x%04X",
         static_cast<unsigned int>(usedLevel));
-
-    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
-    hr = device_.As(&dxgiDevice);
-    if (FAILED(hr)) {
-        LogHResult(L"Query IDXGIDevice failed", hr);
-        return false;
-    }
-
-    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
-    hr = dxgiDevice->GetAdapter(&adapter);
-    if (FAILED(hr)) {
-        LogHResult(L"IDXGIDevice::GetAdapter failed", hr);
-        return false;
-    }
-
-    Microsoft::WRL::ComPtr<IDXGIOutput> output;
-    hr = adapter->EnumOutputs(monitorIndex_, &output);
-    if (FAILED(hr)) {
-        CLogger::Message(0, L"IDXGIAdapter::EnumOutputs failed for monitor index %d",
-            monitorIndex_);
-        LogHResult(L"IDXGIAdapter::EnumOutputs failed", hr);
-        return false;
-    }
 
     Microsoft::WRL::ComPtr<IDXGIOutput1> output1;
     hr = output.As(&output1);

@@ -31,7 +31,9 @@ public:
 
 private:
     void StreamLoop();
-    std::vector<uint8_t> GrabPreviewFrame();
+    std::vector<uint8_t> GrabPreviewFrame(int screenNumber);
+
+    struct ScreenPipeline;
 
     // 配置
     bool rtmpEnabled_ = false;
@@ -53,20 +55,14 @@ private:
     int previewMaxFps_ = 15;
 
     // 采集参数
-    int captureMonitor_ = 0;
+    std::vector<int> captureMonitors_;
     int captureFps_ = 30;
 
-    // 核心组件
-    ICapture* capture_ = nullptr;
-    IEncoder* encoder_ = nullptr;
+    // 每个屏幕使用独立采集、编码和推流链路。
+    std::vector<std::unique_ptr<ScreenPipeline>> screens_;
     std::unique_ptr<HttpPreviewServer> preview_;
-    FlvMuxer flvMuxer_;
-    RtmpPublisher rtmp_;
 
     // 控制
     std::atomic<bool> running_{ false };
     std::thread streamThread_;
-    mutable std::mutex previewMutex_;
-    std::atomic<bool> previewFrameRequested_{false};
-    std::vector<uint8_t> latestJpeg_;
 };

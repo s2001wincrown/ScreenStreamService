@@ -11,10 +11,10 @@
 
 class HttpPreviewServer {
 public:
-    using FrameGrabber = std::function<std::vector<uint8_t>()>;
+    using FrameGrabber = std::function<std::vector<uint8_t>(int screenNumber)>;
 
     HttpPreviewServer(int port, int width, int height,
-        int quality, int maxFps, FrameGrabber grabber);
+        int quality, int maxFps, std::vector<int> screenNumbers, FrameGrabber grabber);
     ~HttpPreviewServer();
 
     void Start();
@@ -27,6 +27,7 @@ private:
     static bool SendAll(SOCKET socket, const char* data, size_t size);
 
     int port_, width_, height_, frameIntervalMs_;
+    std::vector<int> screenNumbers_;
     FrameGrabber grabber_;
     std::atomic<bool> running_{false};
     std::atomic<int> clientCount_{0};

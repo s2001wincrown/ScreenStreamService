@@ -5,14 +5,24 @@
 #include <string>
 #include <chrono>
 #include <algorithm>
+#include <charconv>
 #include <climits>
 #pragma comment(lib, "ws2_32.lib")
 
+namespace {
+bool ParseScreenNumber(const std::string& value, int& screenNumber) {
+    if (value.empty()) return false;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), screenNumber);
+    return result.ec == std::errc{} && result.ptr == value.data() + value.size() &&
+        screenNumber > 0;
+}
+}
+
 HttpPreviewServer::HttpPreviewServer(int port, int width, int height,
-    int quality, int maxFps, FrameGrabber grabber)
+    int quality, int maxFps, std::vector<int> screenNumbers, FrameGrabber grabber)
     : port_(port), width_(width), height_(height),
       frameIntervalMs_(maxFps > 0 ? (std::max)(1, 1000 / maxFps) : 66),
-      grabber_(std::move(grabber)) {}
+      screenNumbers_(std::move(screenNumbers)), grabber_(std::move(grabber)) {}
 
 HttpPreviewServer::~HttpPreviewServer() { Stop(); }
 
@@ -70,29 +80,70 @@ void HttpPreviewServer::ServeClient(SOCKET client) {
         std::string path = firstSpace != std::string::npos && secondSpace != std::string::npos
             ? requestLine.substr(firstSpace + 1, secondSpace - firstSpace - 1)
             : std::string();
+        std::string queryString;
         const size_t query = path.find('?');
-        if (query != std::string::npos) path.resize(query);
+        if (query != std::string::npos) {
+            queryString = path.substr(query + 1);
+            path.resize(query);
+        }
 
-        if (path == "/" || path == "/index.html") {
-            static constexpr char page[] = R"html(<!doctype html>
+        int screenNumber = screenNumbers_.empty() ? 1 : screenNumbers_.front();
+        bool validScreen = true;
+        const size_t screenPathEnd = path.find('/', 1);
+        const std::string screenPath = path.size() > 1
+            ? path.substr(1, screenPathEnd == std::string::npos
+                ? std::string::npos : screenPathEnd - 1)
+            : std::string();
+        if (!screenPath.empty()) {
+            int pathScreenNumber = 0;
+            if (ParseScreenNumber(screenPath, pathScreenNumber)) {
+                screenNumber = pathScreenNumber;
+                path = screenPathEnd == std::string::npos ? "" : path.substr(screenPathEnd);
+            }
+        }
+
+        size_t screenParameter = queryString.find("screen=");
+        if (screenParameter != std::string::npos) {
+            screenParameter += 7;
+            const size_t parameterEnd = queryString.find('&', screenParameter);
+            const std::string value = queryString.substr(screenParameter,
+                parameterEnd == std::string::npos ? std::string::npos : parameterEnd - screenParameter);
+            validScreen = ParseScreenNumber(value, screenNumber);
+        }
+        if (screenNumbers_.empty()) {
+            validScreen = validScreen && screenNumber == 1;
+        } else {
+            validScreen = validScreen && std::find(screenNumbers_.begin(),
+                screenNumbers_.end(), screenNumber) != screenNumbers_.end();
+        }
+
+        const bool pageRequest = path == "/" || path == "/index.html" || path.empty();
+        if (!validScreen) {
+            static constexpr char notFound[] =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            SendAll(client, notFound, sizeof(notFound) - 1);
+        } else if (pageRequest) {
+            const std::string page = R"html(<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ScreenStream Preview</title><style>
 html,body{margin:0;width:100%;height:100%;background:#111;color:#ddd;font:14px sans-serif}
 body{display:grid;place-items:center}img{max-width:100vw;max-height:100vh;object-fit:contain}
 </style></head><body><img id="preview" alt="Waiting for screen capture...">
-<script>const image=document.getElementById('preview');function refresh(){
-image.src='/snapshot.jpg?t='+Date.now()}image.onload=()=>setTimeout(refresh,100);
-image.onerror=()=>setTimeout(refresh,1000);refresh();</script></body></html>)html";
+<script>const screenNumber=)html" + std::to_string(screenNumber) + R"html(;
+const image=document.getElementById('preview');function refresh(){
+image.src='/snapshot.jpg?screen='+screenNumber+'&t='+Date.now()}
+image.onload=()=>setTimeout(refresh,100);image.onerror=()=>setTimeout(refresh,1000);refresh();
+</script></body></html>)html";
             const std::string response =
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" +
-                std::string("Content-Length: ") + std::to_string(sizeof(page) - 1) +
+                std::string("Content-Length: ") + std::to_string(page.size()) +
                 "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + page;
             if (!SendAll(client, response.data(), response.size()))
                 CLogger::LogError(L"HTTP preview page send failed",
                     static_cast<DWORD>(WSAGetLastError()));
         } else if (path == "/snapshot.jpg") {
-            const auto jpeg = grabber_();
+            const auto jpeg = grabber_(screenNumber);
             if (jpeg.empty()) {
                 static constexpr char unavailable[] =
                     "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n"
@@ -120,7 +171,7 @@ image.onerror=()=>setTimeout(refresh,1000);refresh();</script></body></html>)htm
                 bool firstFrameSent = false;
                 while (running_) {
                     nextFrame += std::chrono::milliseconds(frameIntervalMs_);
-                    auto jpeg = grabber_();
+                    auto jpeg = grabber_(screenNumber);
                     if (!jpeg.empty()) {
                         const std::string header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " +
                             std::to_string(jpeg.size()) + "\r\n\r\n";

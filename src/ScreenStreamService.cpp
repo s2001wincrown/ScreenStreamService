@@ -6,6 +6,49 @@
 #include "JpegEncoder.h"
 #include <Logger.h>
 #include <chrono>
+#include <algorithm>
+#include <charconv>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+
+namespace {
+bool ParseMonitorList(const std::string& value, std::vector<int>& monitors) {
+    size_t start = 0;
+    while (start < value.size()) {
+        const size_t end = value.find(',', start);
+        const size_t tokenEnd = end == std::string::npos ? value.size() : end;
+        const size_t first = value.find_first_not_of(" \t", start);
+        if (first == std::string::npos || first >= tokenEnd) return false;
+        const size_t last = value.find_last_not_of(" \t", tokenEnd - 1);
+        int monitor = -1;
+        const auto result = std::from_chars(value.data() + first, value.data() + last + 1, monitor);
+        if (result.ec != std::errc{} || result.ptr != value.data() + last + 1 ||
+            monitor < 0 || monitor == (std::numeric_limits<int>::max)() ||
+            std::find(monitors.begin(), monitors.end(), monitor) != monitors.end())
+            return false;
+        monitors.push_back(monitor);
+        if (end == std::string::npos) break;
+        if (end + 1 == value.size()) return false;
+        start = end + 1;
+    }
+    return !monitors.empty();
+}
+}
+
+struct ScreenStreamService::ScreenPipeline {
+    int monitorIndex = 0;
+    int screenNumber = 1;
+    std::string rtmpUrl;
+    std::unique_ptr<ICapture> capture;
+    std::unique_ptr<IEncoder> encoder;
+    FlvMuxer flvMuxer;
+    RtmpPublisher publisher;
+    std::mutex previewMutex;
+    std::atomic<bool> previewFrameRequested{ false };
+    std::vector<uint8_t> latestJpeg;
+};
 
 ScreenStreamService::ScreenStreamService() {}
 
@@ -22,7 +65,6 @@ bool ScreenStreamService::Initialize(const std::filesystem::path& configPath,
         return false;
     }
 
-    // 读取 RTMP 配置
     rtmpEnabled_ = cfg.GetBool("rtmp", "enabled", true);
     if (rtmpEnabled_) {
         rtmpUrl_ = cfg.Get("rtmp", "url", "rtmp://127.0.0.1/live/stream");
@@ -33,7 +75,6 @@ bool ScreenStreamService::Initialize(const std::filesystem::path& configPath,
         height_ = cfg.GetInt("rtmp", "height", 1080);
     }
 
-    // 读取预览配置
     previewEnabled_ = cfg.GetBool("preview", "enabled", true);
     if (previewEnabled_) {
         previewPort_ = cfg.GetInt("preview", "port", 8888);
@@ -43,43 +84,66 @@ bool ScreenStreamService::Initialize(const std::filesystem::path& configPath,
         previewMaxFps_ = cfg.GetInt("preview", "max_fps", 15);
     }
 
-    // 读取采集配置
-    captureMonitor_ = cfg.GetInt("capture", "monitor", 0);
-    captureFps_ = cfg.GetInt("capture", "fps", 30);
-
-    // 创建采集器
-    CLogger::Message(0, L"Initializing desktop capture: monitor=%d, fps=%d",
-        captureMonitor_, captureFps_);
-    capture_ = CreateCapture(captureMonitor_, captureFps_);
-    if (!capture_) {
-        CLogger::LogMessage(L"Failed to create capture instance");
-        if (errorCode) *errorCode = ERROR_GEN_FAILURE;
-        return false;
-    }
-
-    // 创建编码器（仅在 RTMP 启用时）
-    if (rtmpEnabled_) {
-        auto encoder = EncoderFactory::Create(width_, height_, fps_, bitrate_ * 1000, gop_);
-        encoder_ = encoder.release();
-        if (!encoder_) {
-            CLogger::LogMessage(L"Failed to open any supported video encoder");
-            if (errorCode) *errorCode = ERROR_NOT_SUPPORTED;
+    const std::string monitors = cfg.Get("capture", "monitors");
+    if (monitors.empty()) {
+        const int monitor = cfg.GetInt("capture", "monitor", 0);
+        if (monitor < 0 || monitor == (std::numeric_limits<int>::max)()) {
+            CLogger::LogMessage(L"Invalid capture monitor index in configuration");
+            if (errorCode) *errorCode = ERROR_INVALID_PARAMETER;
             return false;
         }
-        flvMuxer_.Open();
+        captureMonitors_.push_back(monitor);
+    } else if (!ParseMonitorList(monitors, captureMonitors_)) {
+        CLogger::LogMessage(L"Invalid capture monitors list; use unique non-negative indices separated by commas");
+        if (errorCode) *errorCode = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    captureFps_ = cfg.GetInt("capture", "fps", 30);
+
+    for (const int monitorIndex : captureMonitors_) {
+        auto screen = std::make_unique<ScreenPipeline>();
+        screen->monitorIndex = monitorIndex;
+        screen->screenNumber = monitorIndex + 1;
+        screen->capture.reset(CreateCapture(monitorIndex, captureFps_));
+        if (!screen->capture) {
+            CLogger::LogMessage(L"Failed to create capture instance");
+            if (errorCode) *errorCode = ERROR_GEN_FAILURE;
+            return false;
+        }
+
+        if (rtmpEnabled_) {
+            screen->rtmpUrl = rtmpUrl_;
+            if (captureMonitors_.size() > 1) {
+                if (!screen->rtmpUrl.empty() && screen->rtmpUrl.back() != '/')
+                    screen->rtmpUrl += '/';
+                screen->rtmpUrl += std::to_string(screen->screenNumber);
+            }
+            screen->encoder = EncoderFactory::Create(
+                width_, height_, fps_, bitrate_ * 1000, gop_);
+            if (!screen->encoder) {
+                CLogger::LogMessage(L"Failed to open an encoder for a configured screen");
+                if (errorCode) *errorCode = ERROR_NOT_SUPPORTED;
+                return false;
+            }
+            screen->flvMuxer.Open();
+        }
+        screens_.push_back(std::move(screen));
     }
 
-    // 创建预览服务器（仅在预览启用时）
     if (previewEnabled_) {
+        std::vector<int> screenNumbers;
+        screenNumbers.reserve(screens_.size());
+        for (const auto& screen : screens_)
+            screenNumbers.push_back(screen->screenNumber);
         preview_ = std::make_unique<HttpPreviewServer>(
             previewPort_, previewWidth_, previewHeight_,
-            previewQuality_, previewMaxFps_,
-            [this] { return GrabPreviewFrame(); });
+            previewQuality_, previewMaxFps_, std::move(screenNumbers),
+            [this](int screenNumber) { return GrabPreviewFrame(screenNumber); });
     }
 
-    CLogger::Message(0, L"Initialized: RTMP=%s, preview=%s, monitor=%d, capture fps=%d",
+    CLogger::Message(0, L"Initialized: RTMP=%s, preview=%s, screens=%d, capture fps=%d",
         rtmpEnabled_ ? L"ON" : L"OFF", previewEnabled_ ? L"ON" : L"OFF",
-        captureMonitor_, captureFps_);
+        static_cast<int>(screens_.size()), captureFps_);
     return true;
 }
 
@@ -88,46 +152,40 @@ bool ScreenStreamService::Start(DWORD* errorCode) {
         if (errorCode) *errorCode = ERROR_ALREADY_INITIALIZED;
         return false;
     }
-    if (!capture_) {
+    if (screens_.empty()) {
         CLogger::LogMessage(L"Cannot start application: capture is not initialized");
         if (errorCode) *errorCode = ERROR_INVALID_STATE;
         return false;
     }
 
-    if (!capture_->Start()) {
-        CLogger::LogMessage(L"Desktop capture startup failed; see preceding DXGI/D3D11 diagnostics");
-        if (errorCode) *errorCode = ERROR_GEN_FAILURE;
-        return false;
+    for (const auto& screen : screens_) {
+        if (!screen->capture->Start()) {
+            CLogger::Message(0, L"Desktop capture startup failed for screen %d; see preceding diagnostics",
+                screen->screenNumber);
+            for (const auto& startedScreen : screens_)
+                startedScreen->capture->Stop();
+            if (errorCode) *errorCode = ERROR_GEN_FAILURE;
+            return false;
+        }
     }
 
-    if (previewEnabled_) {
-        preview_->Start();
-    }
+    if (previewEnabled_) preview_->Start();
 
     running_ = true;
     streamThread_ = std::thread(&ScreenStreamService::StreamLoop, this);
-
     CLogger::LogMessage(L"Desktop application runtime started");
     return true;
 }
 
 void ScreenStreamService::Stop() {
     const bool wasRunning = running_.exchange(false);
-
     if (streamThread_.joinable()) streamThread_.join();
 
     if (preview_) preview_->Stop();
-    if (rtmpEnabled_) rtmp_.Close();
-    if (capture_) capture_->Stop();
-
-    if (encoder_) {
-        encoder_->Close();
-        delete encoder_;
-        encoder_ = nullptr;
-    }
-    if (capture_) {
-        delete capture_;
-        capture_ = nullptr;
+    for (const auto& screen : screens_) {
+        screen->publisher.Close();
+        screen->capture->Stop();
+        if (screen->encoder) screen->encoder->Close();
     }
 
     if (wasRunning)
@@ -135,87 +193,108 @@ void ScreenStreamService::Stop() {
 }
 
 void ScreenStreamService::StreamLoop() {
-    auto frameInterval = std::chrono::microseconds(1000000 / fps_);
+    const int frameRate = rtmpEnabled_ ? fps_ : captureFps_;
+    const auto frameInterval = std::chrono::microseconds(
+        1000000 / (frameRate > 0 ? frameRate : 30));
     auto lastFrame = std::chrono::steady_clock::now();
-    auto nextRtmpAttempt = lastFrame;
     const int previewFps = previewMaxFps_ > 0 ? previewMaxFps_ : 15;
     const auto previewInterval = std::chrono::milliseconds((std::max)(1, 1000 / previewFps));
-    auto nextPreviewFrame = lastFrame;
-    auto nextPreviewFailureLog = lastFrame;
-    bool rtmpConnected = false;
-    bool previewFrameLogged = false;
+    std::vector<bool> rtmpConnected(screens_.size(), false);
+    std::vector<bool> previewFrameLogged(screens_.size(), false);
+    std::vector<std::chrono::steady_clock::time_point> nextRtmpAttempt(screens_.size(), lastFrame);
+    std::vector<std::chrono::steady_clock::time_point> nextPreviewFrame(screens_.size(), lastFrame);
+    std::vector<std::chrono::steady_clock::time_point> nextPreviewFailureLog(screens_.size(), lastFrame);
 
     while (running_) {
-        auto now = std::chrono::steady_clock::now();
-        if (rtmpEnabled_ && !rtmpConnected && now >= nextRtmpAttempt) {
-            rtmpConnected = rtmp_.Connect(rtmpUrl_, "", "");
-            if (!rtmpConnected) {
-                CLogger::LogMessage(L"RTMP connection failed; retrying in 5 seconds");
-                nextRtmpAttempt = now + std::chrono::seconds(5);
-            }
-        }
-
-        auto elapsed = now - lastFrame;
-
-        if (elapsed >= frameInterval) {
-            lastFrame = now;
-
-            auto texture = capture_->Capture();
-            if (!texture) continue;
-
-            const auto previewNow = std::chrono::steady_clock::now();
-            if (previewEnabled_ && preview_ && previewFrameRequested_.load() &&
-                previewNow >= nextPreviewFrame && previewFrameRequested_.exchange(false)) {
-                nextPreviewFrame = previewNow + previewInterval;
-                auto jpeg = JpegEncoder::Encode(texture, capture_->Width(), capture_->Height(),
-                    previewWidth_, previewHeight_, previewQuality_);
-                if (!jpeg.empty()) {
-                    const size_t jpegSize = jpeg.size();
-                    {
-                        std::lock_guard<std::mutex> lock(previewMutex_);
-                        latestJpeg_ = std::move(jpeg);
-                    }
-                    if (!previewFrameLogged) {
-                        CLogger::Message(0, L"HTTP preview JPEG cache ready on demand: %llu bytes, %dx%d",
-                            static_cast<unsigned long long>(jpegSize), previewWidth_, previewHeight_);
-                        previewFrameLogged = true;
-                    }
-                } else {
-                    if (preview_->ClientCount() > 0)
-                        previewFrameRequested_.store(true);
-                    if (previewNow >= nextPreviewFailureLog) {
-                        CLogger::LogMessage(L"HTTP preview JPEG encoding returned an empty frame");
-                        nextPreviewFailureLog = previewNow + std::chrono::seconds(5);
+        const auto now = std::chrono::steady_clock::now();
+        if (rtmpEnabled_) {
+            for (size_t i = 0; i < screens_.size(); ++i) {
+                auto& screen = *screens_[i];
+                if (!rtmpConnected[i] && now >= nextRtmpAttempt[i]) {
+                    rtmpConnected[i] = screen.publisher.Connect(screen.rtmpUrl, "", "");
+                    if (rtmpConnected[i]) {
+                        screen.flvMuxer.Open();
+                        CLogger::Message(0, L"RTMP connected for screen %d",
+                            screen.screenNumber);
+                    } else {
+                        CLogger::Message(0, L"RTMP connection failed for screen %d; retrying in 5 seconds",
+                            screen.screenNumber);
+                        nextRtmpAttempt[i] = now + std::chrono::seconds(5);
                     }
                 }
             }
+        }
 
-            // RTMP 主链路
-            if (rtmpEnabled_ && rtmpConnected && encoder_) {
-                auto frame = encoder_->Encode(texture);
-                if (!frame.annexb.empty()) {
-                    for (const auto& packet : flvMuxer_.WriteVideo(frame.annexb)) {
-                        if (!rtmp_.Send(packet.data)) {
-                            CLogger::LogMessage(L"RTMP connection lost; retrying in 5 seconds");
-                            rtmp_.Close();
-                            rtmpConnected = false;
-                            nextRtmpAttempt = std::chrono::steady_clock::now() +
-                                std::chrono::seconds(5);
-                            break;
+        const auto elapsed = now - lastFrame;
+        if (elapsed >= frameInterval) {
+            lastFrame = now;
+            for (size_t i = 0; i < screens_.size(); ++i) {
+                auto& screen = *screens_[i];
+                auto texture = screen.capture->Capture();
+                if (!texture) continue;
+
+                const auto previewNow = std::chrono::steady_clock::now();
+                if (previewEnabled_ && preview_ && screen.previewFrameRequested.load() &&
+                    previewNow >= nextPreviewFrame[i] &&
+                    screen.previewFrameRequested.exchange(false)) {
+                    nextPreviewFrame[i] = previewNow + previewInterval;
+                    auto jpeg = JpegEncoder::Encode(texture,
+                        screen.capture->Width(), screen.capture->Height(),
+                        previewWidth_, previewHeight_, previewQuality_);
+                    if (!jpeg.empty()) {
+                        const size_t jpegSize = jpeg.size();
+                        {
+                            std::lock_guard<std::mutex> lock(screen.previewMutex);
+                            screen.latestJpeg = std::move(jpeg);
+                        }
+                        if (!previewFrameLogged[i]) {
+                            CLogger::Message(0, L"HTTP preview JPEG cache ready for screen %d: %llu bytes, %dx%d",
+                                screen.screenNumber, static_cast<unsigned long long>(jpegSize),
+                                previewWidth_, previewHeight_);
+                            previewFrameLogged[i] = true;
+                        }
+                    } else {
+                        if (preview_->ClientCount() > 0)
+                            screen.previewFrameRequested.store(true);
+                        if (previewNow >= nextPreviewFailureLog[i]) {
+                            CLogger::Message(0, L"HTTP preview JPEG encoding failed for screen %d",
+                                screen.screenNumber);
+                            nextPreviewFailureLog[i] = previewNow + std::chrono::seconds(5);
+                        }
+                    }
+                }
+
+                if (rtmpEnabled_ && rtmpConnected[i] && screen.encoder) {
+                    auto frame = screen.encoder->Encode(texture);
+                    if (!frame.annexb.empty()) {
+                        for (const auto& packet : screen.flvMuxer.WriteVideo(frame.annexb)) {
+                            if (!screen.publisher.Send(packet.data)) {
+                                CLogger::Message(0, L"RTMP connection lost for screen %d; retrying in 5 seconds",
+                                    screen.screenNumber);
+                                screen.publisher.Close();
+                                rtmpConnected[i] = false;
+                                nextRtmpAttempt[i] = std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(5);
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
-        else {
+        } else {
             std::this_thread::sleep_for(frameInterval - elapsed);
         }
     }
 }
 
-std::vector<uint8_t> ScreenStreamService::GrabPreviewFrame() {
+std::vector<uint8_t> ScreenStreamService::GrabPreviewFrame(int screenNumber) {
     if (!preview_ || preview_->ClientCount() <= 0) return {};
-    previewFrameRequested_.store(true);
-    std::lock_guard<std::mutex> lock(previewMutex_);
-    return latestJpeg_;
+    for (const auto& screen : screens_) {
+        if (screen->screenNumber == screenNumber) {
+            screen->previewFrameRequested.store(true);
+            std::lock_guard<std::mutex> lock(screen->previewMutex);
+            return screen->latestJpeg;
+        }
+    }
+    return {};
 }

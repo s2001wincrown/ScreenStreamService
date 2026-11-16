@@ -16,6 +16,8 @@ The watchdog restarts the worker if it exits or crashes, with a five-second dela
 
 The HTTP preview page is at `http://127.0.0.1:8888/`. It refreshes finite JPEG snapshots so the browser page can finish loading. JPEG encoding is requested on demand by active preview clients and is skipped when no preview client is connected. `/stream` remains available for clients that want a continuous MJPEG response, which intentionally stays open and may show a loading indicator in a browser tab.
 
+To capture multiple displays, set `monitors` in the `[capture]` section of `Config.ini` to a comma-separated list of zero-based DXGI display indices, such as `monitors=0,1`. If `monitors` is omitted, the existing `monitor=0` single-display setting is used. Each selected display is captured and pushed to its own RTMP stream in sequence; when multiple displays are selected, the configured RTMP URL receives a `/1`, `/2`, etc. suffix based on the display index. Preview the selected display at `http://127.0.0.1:8888/1`, `http://127.0.0.1:8888/2`, and so on (the number is the zero-based DXGI index plus one). `/` previews the first configured display. The `/stream` MJPEG endpoint also accepts these display paths, for example `/2/stream`.
+
 `Config.ini` must remain beside the executable. If a previous version was installed as a Windows service, remove the legacy `ScreenStreamSvc` from an elevated terminal so it cannot launch in Session 0:
 
 ```powershell
